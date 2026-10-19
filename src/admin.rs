@@ -1,6 +1,49 @@
+//! Privileged administration: ownership, pausing, upgrades and contract-wide
+//! configuration.
+//!
+//! Every function here is admin-gated. [`read_admin`] panics with
+//! [`ContractError::NotInitialized`] when no admin is stored, so an
+//! uninitialized contract has no privileged surface rather than an open one.
+//!
+//! # Ownership
+//!
+//! [`update_admin`] replaces the admin in one transaction — fast, and
+//! unrecoverable if the address is wrong. Prefer the two-step handover:
+//! [`propose_admin`] then [`accept_admin`], where the incoming admin must
+//! authorize the acceptance and so proves control before gaining power.
+//! [`cancel_proposed_admin`] withdraws a pending proposal; only one may be
+//! outstanding.
+//!
+//! # Relationship to the timelock
+//!
+//! Once [`crate::timelock`] is enabled, [`update_admin`], [`upgrade`],
+//! [`propose_admin`] and [`accept_admin`] reject direct calls via
+//! [`crate::timelock::require_direct_call_allowed`]; the admin must schedule
+//! the equivalent [`crate::storage_types::TimelockAction`], wait out the delay
+//! and execute. [`accept_admin`] is blocked too, otherwise a proposal made
+//! before the timelock was enabled could be cashed in afterwards and skip the
+//! delay.
+//!
+//! Pausing, fee configuration, key rotation, metadata and migrations stay
+//! directly callable by design — they are incident response or reversible
+//! configuration.
+//!
+//! # Pausing, upgrades, migrations
+//!
+//! [`set_pause`] is the incident switch and [`require_not_paused`] the guard
+//! other modules call. Requesting the state already in effect is a silent
+//! no-op that emits nothing, so a double-pause is not reported twice.
+//!
+//! [`apply_upgrade`] is shared by [`upgrade`] and the timelocked path so both
+//! bump `ContractVersion` and emit the same audit event. [`migrate`] tracks
+//! storage schema versions separately and only moves forward, so a replayed
+//! migration cannot corrupt storage.
+
 use soroban_sdk::{panic_with_error, symbol_short, Address, BytesN, Env};
 
-use crate::{mint::TTL_TEMP, ContractError, DataKey, TransferFeeConfig};
+use crate::{
+    ttl::TTL_TEMP, ContractError, DataKey, TransferFeeConfig, WrapRecord,
+};
 
 /// Minimum duration for an admin proposal, in seconds (1 hour).
 pub(crate) const MIN_PROPOSAL_DURATION: u64 = 60 * 60;
@@ -38,6 +81,8 @@ pub(crate) fn initialize(e: Env, admin: Address, admin_pubkey: BytesN<32>) {
     e.storage()
         .instance()
         .set(&DataKey::AdminPubKey, &admin_pubkey);
+    // Store the initial storage schema version (v1).
+    e.storage().instance().set(&DataKey::SchemaVersion, &1u32);
     crate::events::publish_event(&e, crate::events::Event::AdminInit(admin));
 }
 
@@ -158,26 +203,6 @@ pub(crate) fn migration_version(e: &Env) -> u32 {
         .get(&DataKey::MigrationVersion)
         .unwrap_or(0)
 }
-/// Helper to apply an upgrade: bump version, emit event, update wasm.
-pub(crate) fn apply_upgrade(e: Env, wasm_hash: BytesN<32>) {
-    // Increment contract version
-    let next_version = e
-        .storage()
-        .instance()
-        .get(&DataKey::ContractVersion)
-        .unwrap_or(0)
-        + 1;
-    e.storage()
-        .instance()
-        .set(&DataKey::ContractVersion, &next_version);
-
-    // Emit upgrade event with version
-    e.events()
-        .publish((symbol_short!("upgrade"), next_version), wasm_hash.clone());
-
-    // Update contract wasm
-    e.deployer().update_current_contract_wasm(wasm_hash);
-}
 
 /// Applies a WASM upgrade: bumps the `ContractVersion` counter, emits the
 /// `("upgrade", version)` audit event carrying the new WASM hash, and swaps
@@ -216,11 +241,7 @@ pub(crate) fn apply_upgrade(e: &Env, new_wasm_hash: BytesN<32>) {
 #[allow(deprecated)] // TODO(#718): migrate to #[contractevent]
 pub(crate) fn upgrade(e: Env, new_wasm_hash: BytesN<32>) {
     crate::timelock::require_direct_call_allowed(&e);
-    let current_admin: Address = e
-        .storage()
-        .instance()
-        .get(&DataKey::Admin)
-        .unwrap_or_else(|| panic_with_error!(e, ContractError::NotInitialized));
+    let current_admin = read_admin(&e);
 
     current_admin.require_auth();
 
@@ -231,11 +252,7 @@ pub(crate) fn upgrade(e: Env, new_wasm_hash: BytesN<32>) {
 /// immediately-acceptable proposal would otherwise bypass the delay.
 pub(crate) fn propose_admin(e: Env, new_admin: Address) {
     crate::timelock::require_direct_call_allowed(&e);
-    let current_admin: Address = e
-        .storage()
-        .instance()
-        .get(&DataKey::Admin)
-        .unwrap_or_else(|| panic_with_error!(e, ContractError::NotInitialized));
+    let current_admin = read_admin(&e);
 
     current_admin.require_auth();
 
@@ -253,11 +270,7 @@ pub(crate) fn propose_admin(e: Env, new_admin: Address) {
 /// `cancel_proposed_admin` and reschedule through the controller instead.
 pub(crate) fn accept_admin(e: Env) {
     crate::timelock::require_direct_call_allowed(&e);
-    let _: Address = e
-        .storage()
-        .instance()
-        .get(&DataKey::Admin)
-        .unwrap_or_else(|| panic_with_error!(e, ContractError::NotInitialized));
+    let _ = read_admin(&e);
 
     let pending_admin: Address = e
         .storage()
@@ -272,11 +285,7 @@ pub(crate) fn accept_admin(e: Env) {
 }
 
 pub(crate) fn cancel_proposed_admin(e: Env) {
-    let current_admin: Address = e
-        .storage()
-        .instance()
-        .get(&DataKey::Admin)
-        .unwrap_or_else(|| panic_with_error!(e, ContractError::NotInitialized));
+    let current_admin = read_admin(&e);
 
     current_admin.require_auth();
 
@@ -352,16 +361,12 @@ pub(crate) fn set_wrap_metadata(
         panic_with_error!(e, ContractError::NotInitialized);
     }
 
-    let mut record: WrapRecord = e
-        .storage()
-        .persistent()
-        .get(&key)
-        .unwrap();
+    let mut record: WrapRecord = e.storage().persistent().get(&key).unwrap();
     record.description = Some(description.clone());
     record.image_url = Some(image_url.clone());
 
     e.storage().persistent().set(&key, &record);
-    e.storage().persistent().extend_ttl(&key, TTL_TEMP, TTL_TEMP);
+    crate::ttl::extend_ttl(&e, &key, TTL_TEMP, TTL_TEMP);
 
     e.events().publish(
         (

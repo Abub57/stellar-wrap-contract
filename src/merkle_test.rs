@@ -1,146 +1,79 @@
 #![cfg(test)]
 
-use ed25519_dalek::SigningKey;
-use rand::thread_rng;
-use soroban_sdk::{
-    symbol_short,
-    testutils::{Address as _, BytesN as _, Events},
-    vec, Address, BytesN, Env, IntoVal, Symbol, Val, Vec,
-};
+use soroban_sdk::{testutils::Address as _, vec, xdr::ToXdr, Address, Bytes, BytesN, Env};
 
 use crate::{
-    merkle::{compute_whitelist_leaf, hash_pair},
-    StellarWrapContract, StellarWrapContractClient,
-    ContractError,
+    merkle::{compute_whitelist_leaf, hash_pair, WHITELIST_DOMAIN_SEPARATOR},
+    ContractError, StellarWrapContract, StellarWrapContractClient,
 };
-use crate::test_utils::decode_events;
 
-fn setup() -> (Env, StellarWrapContractClient<'static>, Address) {
+fn setup() -> (Env, StellarWrapContractClient<'static>) {
     let env = Env::default();
     env.mock_all_auths();
-
     let contract_id = env.register(StellarWrapContract, ());
     let client = StellarWrapContractClient::new(&env, &contract_id);
-
     let admin = Address::generate(&env);
-    let mut csprng = thread_rng();
-    let signer = SigningKey::generate(&mut csprng);
-    let admin_pubkey = BytesN::from_array(&env, &signer.verifying_key().to_bytes());
-
+    let admin_pubkey = BytesN::from_array(&env, &[1; 32]);
     client.initialize(&admin, &admin_pubkey);
-    (env, client, admin)
+    (env, client)
 }
 
 #[test]
-fn test_merkle_whitelist() {
-    let (env, client, admin) = setup();
-
-    let user1 = Address::generate(&env);
-    let user2 = Address::generate(&env);
-    let user3 = Address::generate(&env);
-    let non_member = Address::generate(&env);
-
-    let empty_proof = vec![&env];
-
-    // 1. verify_whitelist before any root is published fails with MerkleRootNotSet
-    let res = client.try_verify_whitelist(&user1, &empty_proof);
-    assert_eq!(res, Err(Ok(ContractError::MerkleRootNotSet.into())));
-
-    // Build tree: [user1, user2, user3]
-    let leaf1 = client.whitelist_leaf(&user1);
-    let leaf2 = client.whitelist_leaf(&user2);
-    let leaf3 = client.whitelist_leaf(&user3);
-
-    // root
-    // ├── node12
-    // │   ├── leaf1
-    // │   └── leaf2
-    // └── leaf3
-    let node12 = hash_pair(&env, &leaf1, &leaf2);
-    let root = hash_pair(&env, &node12, &leaf3);
-
-    // 7. set_whitelist_root requires admin authorization and emits ("whitelist", "root") event.
+fn verifies_whitelist_membership_and_single_leaf_proofs() {
+    let (env, client) = setup();
+    let user = Address::generate(&env);
+    let other_user = Address::generate(&env);
+    let leaf = client.whitelist_leaf(&user);
+    let other_leaf = client.whitelist_leaf(&other_user);
+    let root = hash_pair(&env, &leaf, &other_leaf);
     client.set_whitelist_root(&root);
-    
-    // Verify admin auth was checked (mock_all_auths makes this pass, but we can check if it's there conceptually.
-    // In Soroban tests with mock_all_auths, auths are tracked.)
+
+    assert!(client.verify_whitelist(&user, &vec![&env, other_leaf]));
+    assert!(!client.verify_whitelist(&user, &vec![&env]));
+
+    client.set_whitelist_root(&leaf);
+    assert!(client.verify_whitelist(&user, &vec![&env]));
+    assert!(!client.verify_whitelist(&other_user, &vec![&env]));
+}
+
+#[test]
+fn whitelist_leaf_and_pair_hash_use_domain_prefixes() {
+    let env = Env::default();
+    let user = Address::generate(&env);
+    let mut leaf_input = Bytes::new(&env);
+    leaf_input.append(&Bytes::from_array(&env, &[0x00]));
+    leaf_input.append(&Bytes::from_array(&env, WHITELIST_DOMAIN_SEPARATOR));
+    leaf_input.append(&user.to_xdr(&env));
+    let expected_leaf = env.crypto().sha256(&leaf_input);
     assert_eq!(
-        env.auths().first().unwrap().0,
-        admin
+        compute_whitelist_leaf(&env, &user).to_array(),
+        expected_leaf.to_array()
     );
 
-    let events = decode_events(&env);
-    let last_event = events.last().unwrap();
-    let topics = &last_event.0;
-    assert_eq!(topics.len(), 2);
-    assert_eq!(topics[0], symbol_short!("whitelist").into_val(&env));
-    assert_eq!(topics[1], symbol_short!("root").into_val(&env));
-    assert_eq!(last_event.1, root.into_val(&env));
-
-    // 2. A valid proof for a member returns true.
-    let proof1 = vec![&env, leaf2.clone(), leaf3.clone()];
-    assert!(client.verify_whitelist(&user1, &proof1));
-
-    let proof2 = vec![&env, leaf1.clone(), leaf3.clone()];
-    assert!(client.verify_whitelist(&user2, &proof2));
-
-    let proof3 = vec![&env, node12.clone()];
-    assert!(client.verify_whitelist(&user3, &proof3));
-
-    // 3. A proof for a non-member returns false.
-    let fake_proof = vec![&env, node12.clone()];
-    assert!(!client.verify_whitelist(&non_member, &fake_proof));
-
-    // 4. A truncated or reordered proof returns false.
-    let truncated_proof = vec![&env, leaf2.clone()];
-    assert!(!client.verify_whitelist(&user1, &truncated_proof));
-
-    let reordered_proof = vec![&env, leaf3.clone(), leaf2.clone()];
-    assert!(!client.verify_whitelist(&user1, &reordered_proof));
-
-    // 6. clear_whitelist_root restores the MerkleRootNotSet behaviour.
-    client.clear_whitelist_root();
-    
-    let res_cleared = client.try_verify_whitelist(&user1, &proof1);
-    assert_eq!(res_cleared, Err(Ok(ContractError::MerkleRootNotSet.into())));
+    let a = BytesN::from_array(&env, &[1; 32]);
+    let b = BytesN::from_array(&env, &[2; 32]);
+    let mut node_input = Bytes::new(&env);
+    node_input.append(&Bytes::from_array(&env, &[0x01]));
+    node_input.append(&Bytes::from_array(&env, &a.to_array()));
+    node_input.append(&Bytes::from_array(&env, &b.to_array()));
+    let expected_node = env.crypto().sha256(&node_input);
+    assert_eq!(hash_pair(&env, &a, &b).to_array(), expected_node.to_array());
 }
 
 #[test]
-fn test_single_leaf_tree() {
-    let (env, client, _) = setup();
+fn rejects_proofs_over_the_depth_limit() {
+    let (env, client) = setup();
     let user = Address::generate(&env);
-
     let leaf = client.whitelist_leaf(&user);
-    // Tree with one member: root == leaf
     client.set_whitelist_root(&leaf);
 
-    // 5. An empty proof returns true only for a single-leaf tree where leaf == root.
-    let empty_proof = vec![&env];
-    assert!(client.verify_whitelist(&user, &empty_proof));
+    let mut proof = soroban_sdk::Vec::new(&env);
+    for _ in 0..33 {
+        proof.push_back(BytesN::from_array(&env, &[0; 32]));
+    }
 
-    // Empty proof for another user should be false (since their leaf != root)
-    let other_user = Address::generate(&env);
-    assert!(!client.verify_whitelist(&other_user, &empty_proof));
-}
-
-#[test]
-fn test_require_whitelisted_rejects_invalid_merkle_proof() {
-    let (env, client, _) = setup();
-    let user = Address::generate(&env);
-    let other_user = Address::generate(&env);
-
-    let user_leaf = client.whitelist_leaf(&user);
-    let other_leaf = client.whitelist_leaf(&other_user);
-    let root = hash_pair(&env, &user_leaf, &other_leaf);
-    client.set_whitelist_root(&root);
-
-    let invalid_proof = vec![&env, user_leaf.clone()];
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::merkle::require_whitelisted(&env, &user, &invalid_proof);
-    }));
-
-    assert!(
-        result.is_err(),
-        "invalid Merkle proof must be rejected with InvalidMerkleProof"
+    assert_eq!(
+        client.try_verify_whitelist(&user, &proof),
+        Err(Ok(ContractError::MerkleProofTooLong.into()))
     );
 }

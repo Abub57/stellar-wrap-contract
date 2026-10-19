@@ -86,13 +86,13 @@ fn insert_wrap_in_state(
     env.as_contract(contract_id, || {
         let wrap_key = DataKey::Wrap(user.clone(), period);
         let record = WrapRecord {
-            timestamp: updated_at,
+            created_at: updated_at,
             data_hash: BytesN::from_array(env, &[9u8; 32]),
             archetype: symbol_short!("arch"),
             period,
             description: None,
             image_url: None,
-            fsm: WrapLifecycleFSM::new(state, updated_at),
+            lifecycle: WrapLifecycleFSM::new(state, updated_at),
         };
         env.storage().persistent().set(&wrap_key, &record);
     });
@@ -135,8 +135,11 @@ fn test_expire_draft_wrap_after_deadline_succeeds() {
     client.expire_wrap(&user, &period);
 
     let wrap = client.get_wrap(&user, &period).unwrap();
-    assert_eq!(wrap.fsm.state, WrapState::Expired);
-    assert_eq!(wrap.fsm.updated_at, insertion_time + default_duration + 1);
+    assert_eq!(wrap.lifecycle.state, WrapState::Expired);
+    assert_eq!(
+        wrap.lifecycle.updated_at,
+        insertion_time + default_duration + 1
+    );
 }
 
 #[test]
@@ -171,7 +174,7 @@ fn test_expire_pending_wrap_after_deadline_succeeds() {
     client.expire_wrap(&user, &period);
 
     let wrap = client.get_wrap(&user, &period).unwrap();
-    assert_eq!(wrap.fsm.state, WrapState::Expired);
+    assert_eq!(wrap.lifecycle.state, WrapState::Expired);
 }
 
 #[test]
@@ -432,7 +435,7 @@ fn test_expire_just_past_deadline_succeeds() {
     client.expire_wrap(&user, &period);
 
     let wrap = client.get_wrap(&user, &period).unwrap();
-    assert_eq!(wrap.fsm.state, WrapState::Expired);
+    assert_eq!(wrap.lifecycle.state, WrapState::Expired);
 }
 
 // ─── Expiration event emission ──────────────────────────────────────────
@@ -575,7 +578,7 @@ fn test_custom_duration_affects_expire_behavior() {
     client.expire_wrap(&user, &period);
 
     let wrap = client.get_wrap(&user, &period).unwrap();
-    assert_eq!(wrap.fsm.state, WrapState::Expired);
+    assert_eq!(wrap.lifecycle.state, WrapState::Expired);
 }
 
 #[test]
@@ -840,11 +843,11 @@ fn test_expire_one_wrap_does_not_affect_others() {
 
     // period_a should be expired.
     let wrap_a = client.get_wrap(&user, &period_a).unwrap();
-    assert_eq!(wrap_a.fsm.state, WrapState::Expired);
+    assert_eq!(wrap_a.lifecycle.state, WrapState::Expired);
 
     // period_b should remain Active.
     let wrap_b = client.get_wrap(&user, &period_b).unwrap();
-    assert_eq!(wrap_b.fsm.state, WrapState::Active);
+    assert_eq!(wrap_b.lifecycle.state, WrapState::Active);
 }
 
 // ─── Multiple users ─────────────────────────────────────────────────────
@@ -892,9 +895,207 @@ fn test_expire_multiple_users_independently() {
 
     // user_a should be expired.
     let wrap_a = client.get_wrap(&user_a, &period).unwrap();
-    assert_eq!(wrap_a.fsm.state, WrapState::Expired);
+    assert_eq!(wrap_a.lifecycle.state, WrapState::Expired);
 
     // user_b should still be Draft (its own deadline is later).
     let wrap_b = client.get_wrap(&user_b, &period).unwrap();
-    assert_eq!(wrap_b.fsm.state, WrapState::Draft);
+    assert_eq!(wrap_b.lifecycle.state, WrapState::Draft);
+}
+
+// ─── Signature-expiry deadline edge cases ────────────────────────────────
+//
+// The mint-entry gate is `ledger.timestamp() > valid_until`, i.e. the deadline
+// is an INCLUSIVE upper bound.  The following three tests pin the behaviour at
+// the three interesting points around the boundary so a future refactor cannot
+// silently flip the strictness of the comparison.
+
+mod signature_expiry {
+    use super::*;
+    use crate::mint::CURRENT_PAYLOAD_VERSION;
+    use crate::signature::construct_mint_payload;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    const VALID_UNTIL: u64 = 1_000_000u64;
+
+    #[allow(clippy::too_many_arguments)]
+    fn sign_payload(
+        env: &Env,
+        signer: &SigningKey,
+        contract: &Address,
+        user: &Address,
+        period: u64,
+        archetype: &Symbol,
+        data_hash: &BytesN<32>,
+        valid_until: u64,
+    ) -> BytesN<64> {
+        let payload = construct_mint_payload(
+            env,
+            contract,
+            user,
+            period,
+            archetype,
+            data_hash,
+            CURRENT_PAYLOAD_VERSION,
+            valid_until,
+        );
+
+        let mut buf = [0u8; 512];
+        let len = payload.len() as usize;
+        payload.copy_into_slice(&mut buf[..len]);
+
+        let signature = signer.sign(&buf[..len]);
+        BytesN::from_array(env, &signature.to_bytes())
+    }
+
+    /// One ledger second *before* `valid_until` → signature is fully usable.
+    #[test]
+    fn test_signature_expiry_just_before_deadline_succeeds() {
+        let env = Env::default();
+        let contract_id = env.register(StellarWrapContract, ());
+        let client = StellarWrapContractClient::new(&env, &contract_id);
+
+        let signing_key = SigningKey::from_bytes(&[21u8; 32]);
+        let admin_pubkey =
+            BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.initialize(&admin, &admin_pubkey);
+
+        let data_hash = BytesN::from_array(&env, &[33u8; 32]);
+        let archetype = symbol_short!("exp_t1");
+        let period = 202603u64;
+
+        let signature = sign_payload(
+            &env,
+            &signing_key,
+            &contract_id,
+            &user,
+            period,
+            &archetype,
+            &data_hash,
+            VALID_UNTIL,
+        );
+
+        // Just before the inclusive deadline.
+        env.ledger().with_mut(|li| {
+            li.timestamp = VALID_UNTIL - 1; // 999_999
+        });
+
+        client.mint_wrap(
+            &user,
+            &period,
+            &archetype,
+            &data_hash,
+            &CURRENT_PAYLOAD_VERSION,
+            &VALID_UNTIL,
+            &signature,
+        );
+
+        let wrap = client.get_wrap(&user, &period).expect("wrap must exist");
+        assert_eq!(wrap.period, period);
+        assert_eq!(wrap.fsm.state, WrapState::Active);
+    }
+
+    /// Exactly at `valid_until` → signature still accepted because the check
+    /// is strict greater-than (`timestamp > valid_until`).
+    #[test]
+    fn test_signature_expiry_at_exact_deadline_succeeds() {
+        let env = Env::default();
+        let contract_id = env.register(StellarWrapContract, ());
+        let client = StellarWrapContractClient::new(&env, &contract_id);
+
+        let signing_key = SigningKey::from_bytes(&[22u8; 32]);
+        let admin_pubkey =
+            BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.initialize(&admin, &admin_pubkey);
+
+        let data_hash = BytesN::from_array(&env, &[34u8; 32]);
+        let archetype = symbol_short!("exp_t2");
+        let period = 202604u64;
+
+        let signature = sign_payload(
+            &env,
+            &signing_key,
+            &contract_id,
+            &user,
+            period,
+            &archetype,
+            &data_hash,
+            VALID_UNTIL,
+        );
+
+        // Exactly on the inclusive boundary.
+        env.ledger().with_mut(|li| {
+            li.timestamp = VALID_UNTIL; // 1_000_000
+        });
+
+        client.mint_wrap(
+            &user,
+            &period,
+            &archetype,
+            &data_hash,
+            &CURRENT_PAYLOAD_VERSION,
+            &VALID_UNTIL,
+            &signature,
+        );
+
+        let wrap = client.get_wrap(&user, &period).expect("wrap must exist");
+        assert_eq!(wrap.period, period);
+        assert_eq!(wrap.fsm.state, WrapState::Active);
+    }
+
+    /// One ledger second *after* `valid_until` → the signature must be
+    /// rejected with `SignatureExpired` (contract error #57).
+    #[test]
+    #[should_panic(expected = "Error(Contract, #57)")]
+    fn test_signature_expiry_just_after_deadline_fails() {
+        let env = Env::default();
+        let contract_id = env.register(StellarWrapContract, ());
+        let client = StellarWrapContractClient::new(&env, &contract_id);
+
+        let signing_key = SigningKey::from_bytes(&[23u8; 32]);
+        let admin_pubkey =
+            BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+
+        env.mock_all_auths();
+        client.initialize(&admin, &admin_pubkey);
+
+        let data_hash = BytesN::from_array(&env, &[35u8; 32]);
+        let archetype = symbol_short!("exp_t3");
+        let period = 202605u64;
+
+        let signature = sign_payload(
+            &env,
+            &signing_key,
+            &contract_id,
+            &user,
+            period,
+            &archetype,
+            &data_hash,
+            VALID_UNTIL,
+        );
+
+        // One tick past the inclusive deadline.
+        env.ledger().with_mut(|li| {
+            li.timestamp = VALID_UNTIL + 1; // 1_000_001
+        });
+
+        client.mint_wrap(
+            &user,
+            &period,
+            &archetype,
+            &data_hash,
+            &CURRENT_PAYLOAD_VERSION,
+            &VALID_UNTIL,
+            &signature,
+        );
+    }
 }

@@ -10,6 +10,7 @@
 use soroban_sdk::{panic_with_error, symbol_short, xdr::ToXdr, Bytes, BytesN, Env, Vec};
 
 use crate::{
+    constants::{MAX_PENDING_OPERATIONS, TTL_ONE_YEAR},
     storage_types::{TimelockAction, TimelockOperation},
     ContractError, DataKey,
 };
@@ -20,6 +21,12 @@ pub const MIN_DELAY: u64 = 3_600;
 /// Largest delay the timelock accepts (30 days). Prevents bricking the contract
 /// with an effectively infinite delay.
 pub const MAX_DELAY: u64 = 30 * 24 * 3_600;
+/// Grace period after ETA during which an operation may still be executed.
+///
+/// Once `now > eta + GRACE_PERIOD`, the operation is considered expired and
+/// can no longer be executed. It must be swept from the queue by anyone.
+/// Standard value: 14 days (1,209,600 seconds).
+pub const GRACE_PERIOD: u64 = 14 * 24 * 3_600;
 
 /// Returns the configured delay in seconds, or `None` while the timelock is
 /// disabled.
@@ -225,6 +232,8 @@ pub(crate) fn cancel(e: Env, id: BytesN<32>) {
 /// # Panics
 /// - [`ContractError::TimelockOperationNotFound`] if `id` is not queued.
 /// - [`ContractError::TimelockNotReady`] if the ETA has not been reached.
+/// - [`ContractError::TimelockOperationExpired`] if the operation is past its
+///   grace period (`now > eta + GRACE_PERIOD`).
 #[allow(deprecated)] // TODO(#718): migrate to #[contractevent]
 pub(crate) fn execute(e: Env, id: BytesN<32>) {
     let admin = crate::admin::read_admin(&e);
@@ -236,8 +245,14 @@ pub(crate) fn execute(e: Env, id: BytesN<32>) {
         .get(&DataKey::TimelockOp(id.clone()))
         .unwrap_or_else(|| panic_with_error!(e, ContractError::TimelockOperationNotFound));
 
-    if e.ledger().timestamp() < op.eta {
+    let now = e.ledger().timestamp();
+    if now < op.eta {
         panic_with_error!(e, ContractError::TimelockNotReady);
+    }
+    // Check if the operation has expired (past grace period).
+    let expiry = op.eta.saturating_add(GRACE_PERIOD);
+    if now > expiry {
+        panic_with_error!(e, ContractError::TimelockOperationExpired);
     }
 
     remove_op(&e, &id);
@@ -276,6 +291,33 @@ pub(crate) fn execute(e: Env, id: BytesN<32>) {
 
     e.events()
         .publish((symbol_short!("timelock"), symbol_short!("exec")), id);
+}
+
+/// Permissionless: remove a timelock operation that has passed its grace
+/// period. Keeps the pending list clean.
+///
+/// # Panics
+/// - [`ContractError::TimelockOperationNotFound`] if `id` is not queued.
+/// - [`ContractError::TimelockOperationNotExpired`] if the operation's
+///   grace period has not yet elapsed (`now <= eta + GRACE_PERIOD`).
+#[allow(deprecated)] // TODO(#718): migrate to #[contractevent]
+pub(crate) fn sweep_expired(e: Env, id: BytesN<32>) {
+    let op: TimelockOperation = e
+        .storage()
+        .persistent()
+        .get(&DataKey::TimelockOp(id.clone()))
+        .unwrap_or_else(|| panic_with_error!(e, ContractError::TimelockOperationNotFound));
+
+    let now = e.ledger().timestamp();
+    let expiry = op.eta.saturating_add(GRACE_PERIOD);
+    if now <= expiry {
+        panic_with_error!(e, ContractError::TimelockOperationNotExpired);
+    }
+
+    remove_op(&e, &id);
+
+    e.events()
+        .publish((symbol_short!("timelock"), symbol_short!("sweep")), id);
 }
 
 /// Return a scheduled operation by id, or `None` if it is not queued.

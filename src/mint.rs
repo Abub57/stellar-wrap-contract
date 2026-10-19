@@ -1,17 +1,16 @@
 use soroban_sdk::{panic_with_error, symbol_short, Address, BytesN, Env, Symbol};
 
 use crate::{
+    events::{MintEventData, MintEventType},
+    optout,
     signature::verify_mint_signature,
     storage_accounting,
     storage_types::{WrapLifecycleFSM, WrapState},
+    ttl::TTL_ONE_YEAR,
     ContractError, DataKey, WrapRecord,
 };
 
-const TTL_ONE_YEAR: u32 = 17_280 * 365;
-/// TTL for temporary storage entries (~1 day in ledgers at 5s/ledger).
-/// Used for non-critical data migrated from Instance to Temporary storage.
-pub(crate) const TTL_TEMP: u32 = 17_280;
-pub const CURRENT_PAYLOAD_VERSION: u32 = 1;
+pub const CURRENT_PAYLOAD_VERSION: u32 = 2;
 /// Default expiration duration for unverified wraps: 7 days in seconds.
 const DEFAULT_EXPIRATION_SECONDS: u64 = 7 * 24 * 60 * 60;
 pub const MIN_PERIOD_YEAR: u64 = 2024;
@@ -110,9 +109,7 @@ pub(crate) fn update_latest_period(e: &Env, user: &Address, period: u64) {
 ///   - `bridge_wrap_in`: emits `br_in` event and persists `InboundBridgeRecord`.
 /// - **Pre-Validation**: Callers handle authorization (`require_auth`), paused checks (`require_not_paused`), signature verification, and replay protection prior to calling `insert_wrap_record`.
 pub(crate) fn insert_wrap_record(e: &Env, user: &Address, period: u64, record: &WrapRecord) {
-    if e.storage().persistent().has(&DataKey::OptOut(user.clone())) {
-        panic_with_error!(e, ContractError::UserOptedOut);
-    }
+    optout::require_not_opted_out(e, user);
 
     let wrap_key = DataKey::Wrap(user.clone(), period);
     if e.storage().persistent().has(&wrap_key) {
@@ -130,7 +127,9 @@ pub(crate) fn insert_wrap_record(e: &Env, user: &Address, period: u64, record: &
     // Update wrap count and account for count entry if first insert
     let count_key = DataKey::WrapCount(user.clone());
     let current_count: u32 = e.storage().persistent().get(&count_key).unwrap_or(0);
-    let next_count = current_count + 1;
+    let next_count = current_count
+        .checked_add(1)
+        .unwrap_or_else(|| panic_with_error!(e, ContractError::ArithmeticOverflow));
     e.storage().persistent().set(&count_key, &next_count);
     e.storage()
         .persistent()
@@ -138,7 +137,9 @@ pub(crate) fn insert_wrap_record(e: &Env, user: &Address, period: u64, record: &
 
     let total_key = DataKey::TotalWrapCount;
     let current_total: u32 = e.storage().persistent().get(&total_key).unwrap_or(0);
-    let next_total = current_total + 1;
+    let next_total = current_total
+        .checked_add(1)
+        .unwrap_or_else(|| panic_with_error!(e, ContractError::ArithmeticOverflow));
     e.storage().persistent().set(&total_key, &next_total);
     e.storage()
         .persistent()
@@ -207,6 +208,7 @@ pub(crate) fn mint_wrap(
     archetype: Symbol,
     data_hash: BytesN<32>,
     payload_version: u32,
+    valid_until: u64,
     signature: BytesN<64>,
 ) {
     crate::admin::require_not_paused(&e);
@@ -214,6 +216,10 @@ pub(crate) fn mint_wrap(
 
     validate_period(&e, period);
     validate_payload_version(&e, payload_version);
+
+    if e.ledger().timestamp() > valid_until {
+        panic_with_error!(e, ContractError::SignatureExpired);
+    }
 
     let admin_pubkey = get_admin_pubkey(&e);
     if let Err(err) = verify_mint_signature(
@@ -225,6 +231,7 @@ pub(crate) fn mint_wrap(
         &archetype,
         &data_hash,
         payload_version,
+        valid_until,
         &signature,
     ) {
         panic_with_error!(e, err);
@@ -232,11 +239,11 @@ pub(crate) fn mint_wrap(
 
     let now = e.ledger().timestamp();
     let record = WrapRecord {
-        timestamp: now,
+        created_at: now,
         data_hash,
         archetype: archetype.clone(),
         period,
-        fsm: WrapLifecycleFSM::new(WrapState::Active, now),
+        lifecycle: WrapLifecycleFSM::new(WrapState::Active, now),
         description: None,
         image_url: None,
     };
@@ -288,10 +295,14 @@ pub(crate) fn mint_wrap_batch(
     }
 
     if let Some(agg_sig) = aggregated_signature {
-        // Validate payload version of items
+        // Validate payload version and expiry of items
+        let now = e.ledger().timestamp();
         for item in items.iter() {
             validate_period(&e, item.period);
             validate_payload_version(&e, item.payload_version);
+            if now > item.valid_until {
+                panic_with_error!(&e, ContractError::SignatureExpired);
+            }
         }
         let payload_version = items.get(0).unwrap().payload_version;
         if let Err(err) = crate::signature::verify_batch_aggregated_signature(
@@ -306,9 +317,13 @@ pub(crate) fn mint_wrap_batch(
         }
     } else {
         // Individual signatures inside batch items
+        let now = e.ledger().timestamp();
         for item in items.iter() {
             validate_period(&e, item.period);
             validate_payload_version(&e, item.payload_version);
+            if now > item.valid_until {
+                panic_with_error!(&e, ContractError::SignatureExpired);
+            }
 
             if let Err(err) = verify_mint_signature(
                 &e,
@@ -319,6 +334,7 @@ pub(crate) fn mint_wrap_batch(
                 &item.archetype,
                 &item.data_hash,
                 item.payload_version,
+                item.valid_until,
                 &item.signature,
             ) {
                 panic_with_error!(e, err);
@@ -330,11 +346,11 @@ pub(crate) fn mint_wrap_batch(
     for item in items.iter() {
         let now = e.ledger().timestamp();
         let record = WrapRecord {
-            timestamp: now,
+            created_at: now,
             data_hash: item.data_hash.clone(),
             archetype: item.archetype.clone(),
             period: item.period,
-            fsm: WrapLifecycleFSM::new(WrapState::Active, now),
+            lifecycle: WrapLifecycleFSM::new(WrapState::Active, now),
             description: None,
             image_url: None,
         };
@@ -364,12 +380,12 @@ pub(crate) fn transition_wrap_state(e: Env, user: Address, period: u64, next_sta
         .get(&wrap_key)
         .unwrap_or_else(|| panic_with_error!(e, ContractError::WrapNotFound));
 
-    if record.fsm.state == WrapState::Bridged {
+    if record.lifecycle.state == WrapState::Bridged {
         panic_with_error!(e, ContractError::InvalidStateTransition);
     }
 
     let now = e.ledger().timestamp();
-    if !record.fsm.transition_to(next_state, now) {
+    if !record.lifecycle.transition_to(next_state, now) {
         panic_with_error!(e, ContractError::InvalidStateTransition);
     }
 
@@ -432,13 +448,13 @@ pub(crate) fn expire_wrap(e: Env, user: Address, period: u64) {
 
     let now = e.ledger().timestamp();
     let duration = get_expiration_duration(&e);
-    let expires_at = record.fsm.updated_at.saturating_add(duration);
+    let expires_at = record.lifecycle.updated_at.saturating_add(duration);
 
     if now <= expires_at {
         panic_with_error!(e, ContractError::WrapNotExpired);
     }
 
-    if !record.fsm.transition_to(WrapState::Expired, now) {
+    if !record.lifecycle.transition_to(WrapState::Expired, now) {
         panic_with_error!(e, ContractError::InvalidStateTransition);
     }
 

@@ -20,6 +20,12 @@
 /// effectively never expire for active participants.
 pub(crate) const TTL_ONE_YEAR: u32 = 17_280 * 365;
 
+/// Maximum number of timelock operations that may be queued at once.
+///
+/// Guards the `TimelockOps` index vector against unbounded growth (see
+/// `timelock::schedule` and `timelock::MAX_PENDING_OPERATIONS`).
+pub(crate) const MAX_PENDING_OPERATIONS: u32 = 10;
+
 /// Persistent-storage TTL representing approximately one calendar day.
 ///
 /// Used for short-lived, non-critical data that is migrated from Instance
@@ -27,3 +33,23 @@ pub(crate) const TTL_ONE_YEAR: u32 = 17_280 * 365;
 /// a safe buffer for eventual renewal without paying the cost of a full
 /// year of rent for entries that may be overwritten soon.
 pub(crate) const TTL_TEMP: u32 = 17_280;
+
+/// Domain separator for merkle leaves: all leaf preimages are prefixed with
+/// 0x00 before hashing.
+///
+/// This prevents a second-preimage attack where a 64-byte internal node
+/// preimage (two 32-byte hashes) could be interpreted as a leaf preimage.
+pub(crate) const MERKLE_LEAF_PREFIX: u8 = 0x00;
+
+/// Domain separator for internal merkle nodes: all internal node preimages are
+/// prefixed with 0x01 before hashing.
+///
+/// See `MERKLE_LEAF_PREFIX` for rationale.
+pub(crate) const MERKLE_NODE_PREFIX: u8 = 0x01;
+
+/// Maximum accepted depth for a merkle proof.
+///
+/// A proof for a tree with ``n`` leaves has at most `ceil(log2(n)` siblings.
+/// 32 levels supports trees up to 2^32 leaves (about 4 billion members) while
+/// bounding verification cost to 32 SHA-256 calls.
+pub(crate) const MAX_PROOF_DEPTH: u32 = 32;

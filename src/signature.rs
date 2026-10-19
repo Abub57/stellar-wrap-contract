@@ -4,7 +4,6 @@ use alloc::vec;
 use ed25519_dalek::{Signature, VerifyingKey};
 use soroban_sdk::{contracttype, xdr::ToXdr, Address, Bytes, BytesN, Env, Symbol};
 
-use alloc::vec;
 use crate::ContractError;
 
 /// Domain separator used for mint signatures.
@@ -15,6 +14,26 @@ use crate::ContractError;
 /// signing schemes.
 pub const MINT_DOMAIN_SEPARATOR: &[u8; 15] = b"stellar-wrap-v1";
 
+/// Current mint signature scheme version.
+///
+/// This is a scheme discriminant, distinct from the period and data hash. It
+/// identifies the construction used to build the signed payload so that a
+/// future scheme can be introduced without invalidating every outstanding
+/// signature at once. See [`SUPPORTED_MINT_SCHEME_VERSIONS`] for the migration
+/// window semantics.
+pub const MINT_SCHEME_VERSION: u32 = 1;
+
+/// Scheme versions accepted by [`verify_mint_signature`].
+///
+/// During a migration window more than one version may be listed so that
+/// signatures produced under the previous scheme remain valid while signers
+/// roll over to the new one. Retiring a scheme is done by removing its version
+/// from this set once the migration window closes; payloads carrying a version
+/// that is not present here are rejected with
+/// [`ContractError::InvalidSignature`] rather than being assumed to use the
+/// current scheme.
+pub const SUPPORTED_MINT_SCHEME_VERSIONS: &[u32] = &[MINT_SCHEME_VERSION];
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MintPayload {
@@ -24,6 +43,7 @@ pub struct MintPayload {
     pub payload_version: u32,
     pub period: u64,
     pub user: Address,
+    pub valid_until: u64,
 }
 
 /// Construct the canonical mint payload that is signed by the admin.
@@ -39,6 +59,7 @@ pub fn construct_mint_payload(
     archetype: &Symbol,
     data_hash: &BytesN<32>,
     payload_version: u32,
+    valid_until: u64,
 ) -> Bytes {
     let mut payload = Bytes::new(e);
     payload.append(&Bytes::from_array(e, MINT_DOMAIN_SEPARATOR));
@@ -50,6 +71,7 @@ pub fn construct_mint_payload(
         payload_version,
         period,
         user: user.clone(),
+        valid_until,
     };
 
     payload.append(&typed_payload.to_xdr(e));
@@ -106,8 +128,14 @@ fn verify_ed25519(
 /// signature is bound to the current contract instance, the target user,
 /// the period, the archetype, and the data hash.
 ///
+/// The `payload_version` argument is the scheme discriminant. It is rejected
+/// with [`ContractError::InvalidSignature`] unless it appears in
+/// [`SUPPORTED_MINT_SCHEME_VERSIONS`], so an unrecognized scheme is never
+/// silently treated as the current one.
+///
 /// Every rejection — malformed key, tampered payload, wrong key, corrupted
-/// signature — surfaces as [`ContractError::InvalidSignature`].
+/// signature, unsupported scheme version — surfaces as
+/// [`ContractError::InvalidSignature`].
 #[allow(clippy::too_many_arguments)]
 pub fn verify_mint_signature(
     e: &Env,
@@ -118,8 +146,13 @@ pub fn verify_mint_signature(
     archetype: &Symbol,
     data_hash: &BytesN<32>,
     payload_version: u32,
+    valid_until: u64,
     signature: &BytesN<64>,
 ) -> Result<(), ContractError> {
+    if !SUPPORTED_MINT_SCHEME_VERSIONS.contains(&payload_version) {
+        return Err(ContractError::InvalidSignature);
+    }
+
     let payload = construct_mint_payload(
         e,
         contract_id,
@@ -128,12 +161,23 @@ pub fn verify_mint_signature(
         archetype,
         data_hash,
         payload_version,
+        valid_until,
     );
     verify_ed25519(admin_pubkey, &payload, signature)
 }
 
 /// Domain separator used for batch aggregated signatures.
 pub const BATCH_MINT_DOMAIN_SEPARATOR: &[u8; 21] = b"stellar-wrap-batch-v1";
+
+/// Current batch mint signature scheme version.
+pub const BATCH_MINT_SCHEME_VERSION: u32 = 1;
+
+/// Scheme versions accepted by [`verify_batch_aggregated_signature`].
+///
+/// Same migration semantics as [`SUPPORTED_MINT_SCHEME_VERSIONS`]: multiple
+/// versions may coexist during a migration window, and a version is retired by
+/// removing it from this set.
+pub const SUPPORTED_BATCH_MINT_SCHEME_VERSIONS: &[u32] = &[BATCH_MINT_SCHEME_VERSION];
 
 /// Construct the canonical batch payload representing a commitment to an ordered set of batch wrap items.
 pub fn construct_batch_mint_payload(
@@ -158,6 +202,10 @@ pub fn construct_batch_mint_payload(
 
 /// Verify an aggregated batch signature over a set of batch wrap items.
 ///
+/// The `payload_version` argument is the scheme discriminant and is rejected
+/// with [`ContractError::InvalidSignature`] unless it appears in
+/// [`SUPPORTED_BATCH_MINT_SCHEME_VERSIONS`].
+///
 /// Any rejection surfaces as [`ContractError::InvalidSignature`].
 pub fn verify_batch_aggregated_signature(
     e: &Env,
@@ -167,11 +215,23 @@ pub fn verify_batch_aggregated_signature(
     payload_version: u32,
     aggregated_signature: &BytesN<64>,
 ) -> Result<(), ContractError> {
+    if !SUPPORTED_BATCH_MINT_SCHEME_VERSIONS.contains(&payload_version) {
+        return Err(ContractError::InvalidSignature);
+    }
+
     let payload = construct_batch_mint_payload(e, contract_id, items, payload_version);
     verify_ed25519(admin_pubkey, &payload, aggregated_signature)
 }
 
 pub const INBOUND_BRIDGE_DOMAIN_SEPARATOR: &[u8; 18] = b"stellar-bridge-in1";
+
+/// Current inbound bridge signature scheme version.
+pub const INBOUND_BRIDGE_SCHEME_VERSION: u32 = 1;
+
+/// Scheme versions accepted by [`verify_inbound_bridge_signature`].
+///
+/// Same migration semantics as [`SUPPORTED_MINT_SCHEME_VERSIONS`].
+pub const SUPPORTED_INBOUND_BRIDGE_SCHEME_VERSIONS: &[u32] = &[INBOUND_BRIDGE_SCHEME_VERSION];
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -179,6 +239,7 @@ pub struct InboundBridgePayload {
     pub archetype: Symbol,
     pub contract_id: Address,
     pub data_hash: BytesN<32>,
+    pub payload_version: u32,
     pub period: u64,
     pub recipient: Address,
     pub source_chain: u32,
@@ -195,6 +256,7 @@ pub fn construct_inbound_bridge_payload(
     period: u64,
     archetype: &Symbol,
     data_hash: &BytesN<32>,
+    payload_version: u32,
 ) -> Bytes {
     let mut payload = Bytes::new(e);
     payload.append(&Bytes::from_array(e, INBOUND_BRIDGE_DOMAIN_SEPARATOR));
@@ -203,6 +265,7 @@ pub fn construct_inbound_bridge_payload(
         archetype: archetype.clone(),
         contract_id: contract_id.clone(),
         data_hash: data_hash.clone(),
+        payload_version,
         period,
         recipient: recipient.clone(),
         source_chain,
@@ -224,8 +287,13 @@ pub fn verify_inbound_bridge_signature(
     period: u64,
     archetype: &Symbol,
     data_hash: &BytesN<32>,
+    payload_version: u32,
     signature: &BytesN<64>,
 ) -> Result<(), ContractError> {
+    if !SUPPORTED_INBOUND_BRIDGE_SCHEME_VERSIONS.contains(&payload_version) {
+        return Err(ContractError::InvalidSignature);
+    }
+
     let payload = construct_inbound_bridge_payload(
         e,
         contract_id,
@@ -235,6 +303,7 @@ pub fn verify_inbound_bridge_signature(
         period,
         archetype,
         data_hash,
+        payload_version,
     );
     verify_ed25519(relayer_pubkey, &payload, signature)
 }
@@ -262,6 +331,7 @@ mod tests {
         archetype: &Symbol,
         data_hash: &BytesN<32>,
         payload_version: u32,
+        valid_until: u64,
     ) -> BytesN<64> {
         let payload = construct_mint_payload(
             env,
@@ -271,14 +341,11 @@ mod tests {
             archetype,
             data_hash,
             payload_version,
+            valid_until,
         );
-
-        let len = payload.len() as usize;
-        let mut out = vec![0u8; len];
-        payload.copy_into_slice(&mut out);
-
-        let signature = signer.sign(&out);
-        BytesN::from_array(env, &signature.to_bytes())
+        let mut output = vec![0u8; payload.len() as usize];
+        payload.copy_into_slice(&mut output);
+        BytesN::from_array(env, &signer.sign(&output).to_bytes())
     }
 
     #[test]
@@ -289,9 +356,18 @@ mod tests {
         let archetype = symbol_short!("arch");
         let data_hash = BytesN::from_array(&env, &[42u8; 32]);
         let period = 202512u64;
+        let valid_until = 9999999u64;
 
-        let payload =
-            construct_mint_payload(&env, &contract_id, &user, period, &archetype, &data_hash, 1);
+        let payload = construct_mint_payload(
+            &env,
+            &contract_id,
+            &user,
+            period,
+            &archetype,
+            &data_hash,
+            2,
+            valid_until,
+        );
 
         let mut expected = Bytes::new(&env);
         expected.append(&Bytes::from_array(&env, MINT_DOMAIN_SEPARATOR));
@@ -300,12 +376,28 @@ mod tests {
             archetype: archetype.clone(),
             contract_id: contract_id.clone(),
             data_hash: data_hash.clone(),
-            payload_version: 1,
+            payload_version: 2,
             period,
             user: user.clone(),
+            valid_until,
         };
         expected.append(&typed_payload.to_xdr(&env));
 
+        let payload =
+            construct_mint_payload(&env, &contract_id, &user, period, &archetype, &data_hash, 1);
+        let mut expected = Bytes::new(&env);
+        expected.append(&Bytes::from_array(&env, MINT_DOMAIN_SEPARATOR));
+        expected.append(
+            &MintPayload {
+                archetype: archetype.clone(),
+                contract_id: contract_id.clone(),
+                data_hash: data_hash.clone(),
+                payload_version: 1,
+                period,
+                user: user.clone(),
+            }
+            .to_xdr(&env),
+        );
         assert_eq!(payload, expected);
     }
 
@@ -317,6 +409,7 @@ mod tests {
         let archetype = symbol_short!("arch");
         let data_hash = BytesN::from_array(&env, &[7u8; 32]);
         let period = 202601u64;
+        let valid_until = u64::MAX;
 
         let signing_key = SigningKey::from_bytes(&[11u8; 32]);
         let admin_pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
@@ -328,7 +421,8 @@ mod tests {
             period,
             &archetype,
             &data_hash,
-            1,
+            2,
+            valid_until,
         );
 
         assert!(verify_mint_signature(
@@ -339,7 +433,8 @@ mod tests {
             period,
             &archetype,
             &data_hash,
-            1,
+            2,
+            valid_until,
             &signature,
         )
         .is_ok());
@@ -353,6 +448,7 @@ mod tests {
         let archetype = symbol_short!("arch");
         let data_hash = BytesN::from_array(&env, &[8u8; 32]);
         let period = 202602u64;
+        let valid_until = u64::MAX;
 
         let signing_key = SigningKey::from_bytes(&[12u8; 32]);
         let admin_pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
@@ -367,7 +463,8 @@ mod tests {
                 period,
                 &archetype,
                 &data_hash,
-                1,
+                2,
+                valid_until,
                 &invalid_signature,
             )
             .unwrap();
@@ -377,14 +474,48 @@ mod tests {
     }
 
     #[test]
+    fn test_verify_mint_signature_rejects_unsupported_version() {
+        let env = Env::default();
+        let contract_id = env.register(StellarWrapContract, ());
+        let user = Address::generate(&env);
+        let archetype = symbol_short!("arch");
+        let data_hash = BytesN::from_array(&env, &[8u8; 32]);
+        let signing_key = SigningKey::from_bytes(&[12u8; 32]);
+        let admin_pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
+        let signature = sign_payload(
+            &env,
+            &signing_key,
+            &contract_id,
+            &user,
+            202602,
+            &archetype,
+            &data_hash,
+            2,
+      );
+
+        assert_eq!(
+            verify_mint_signature(
+                &env,
+                &admin_pubkey,
+                &contract_id,
+                &user,
+                202602,
+                &archetype,
+                &data_hash,
+                2,
+                &signature,
+            ),
+            Err(ContractError::InvalidSignature)
+        );
+    }
+
+    #[test]
     fn test_verify_mint_signature_rejects_wrong_key() {
         let env = Env::default();
         let contract_id = env.register(StellarWrapContract, ());
         let user = Address::generate(&env);
         let archetype = symbol_short!("arch");
         let data_hash = BytesN::from_array(&env, &[9u8; 32]);
-        let period = 202603u64;
-
         let signing_key = SigningKey::from_bytes(&[13u8; 32]);
         let wrong_signing_key = SigningKey::from_bytes(&[14u8; 32]);
         let admin_pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
@@ -393,28 +524,24 @@ mod tests {
             &wrong_signing_key,
             &contract_id,
             &user,
-            period,
+            202603,
             &archetype,
             &data_hash,
             1,
         );
 
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            verify_mint_signature(
-                &env,
-                &admin_pubkey,
-                &contract_id,
-                &user,
-                period,
-                &archetype,
-                &data_hash,
-                1,
-                &wrong_signature,
-            )
-            .unwrap();
-        }));
-
-        assert!(result.is_err());
+        assert!(verify_mint_signature(
+            &env,
+            &admin_pubkey,
+            &contract_id,
+            &user,
+            202603,
+            &archetype,
+            &data_hash,
+            1,
+            &wrong_signature,
+        )
+        .is_err());
     }
 
     #[test]
@@ -437,7 +564,7 @@ mod tests {
         let invalid_sig = BytesN::from_array(&env, &[0u8; 64]);
 
         let result = catch_unwind(AssertUnwindSafe(|| {
-            client.mint_wrap(&user, &period, &archetype, &data_hash, &1u32, &invalid_sig);
+            client.mint_wrap(&user, &period, &archetype, &data_hash, &CURRENT_PAYLOAD_VERSION, &u64::MAX, &invalid_sig);
         }));
 
         assert!(result.is_err());
@@ -447,44 +574,28 @@ mod tests {
     fn test_verify_batch_aggregated_signature_success() {
         let env = Env::default();
         let contract_id = env.register(StellarWrapContract, ());
-        let user1 = Address::generate(&env);
-        let user2 = Address::generate(&env);
         let archetype = symbol_short!("arch");
         let data_hash = BytesN::from_array(&env, &[1u8; 32]);
-        let period1 = 202601u64;
-        let period2 = 202602u64;
-
-        let item1 = crate::storage_types::BatchWrapItem {
-            user: user1,
-            period: period1,
-            archetype: archetype.clone(),
-            data_hash: data_hash.clone(),
-            payload_version: 1,
-            signature: BytesN::from_array(&env, &[0u8; 64]),
-        };
-        let item2 = crate::storage_types::BatchWrapItem {
-            user: user2,
-            period: period2,
-            archetype: archetype.clone(),
-            data_hash: data_hash.clone(),
-            payload_version: 1,
-            signature: BytesN::from_array(&env, &[0u8; 64]),
-        };
-
         let mut items = soroban_sdk::Vec::new(&env);
-        items.push_back(item1);
-        items.push_back(item2);
-
+        for (user, period) in [
+            (Address::generate(&env), 202601),
+            (Address::generate(&env), 202602),
+        ] {
+            items.push_back(crate::storage_types::BatchWrapItem {
+                user,
+                period,
+                archetype: archetype.clone(),
+                data_hash: data_hash.clone(),
+                payload_version: 1,
+                signature: BytesN::from_array(&env, &[0u8; 64]),
+            });
+        }
         let signing_key = SigningKey::from_bytes(&[25u8; 32]);
         let admin_pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
-
         let payload = construct_batch_mint_payload(&env, &contract_id, &items, 1);
-        let len = payload.len() as usize;
-        let mut out = vec![0u8; len];
-        payload.copy_into_slice(&mut out);
-
-        let agg_sig_bytes = signing_key.sign(&out);
-        let agg_sig = BytesN::from_array(&env, &agg_sig_bytes.to_bytes());
+        let mut output = vec![0u8; payload.len() as usize];
+        payload.copy_into_slice(&mut output);
+        let signature = BytesN::from_array(&env, &signing_key.sign(&output).to_bytes());
 
         assert!(verify_batch_aggregated_signature(
             &env,
@@ -492,14 +603,11 @@ mod tests {
             &contract_id,
             &items,
             1,
-            &agg_sig,
+            &signature,
         )
         .is_ok());
     }
 
-    /// Regression: batch of MAX_BATCH_SIZE items must not panic in verify_ed25519.
-    /// The aggregated payload for 100 items is ~12-15 KiB, far beyond the
-    /// old 512-byte stack buffer.
     #[test]
     fn test_verify_batch_max_size_does_not_panic() {
         let env = Env::default();
@@ -519,13 +627,13 @@ mod tests {
                 archetype: archetype.clone(),
                 data_hash: data_hash.clone(),
                 payload_version: 1,
+                valid_until: u64::MAX,
                 signature: BytesN::from_array(&env, &[0u8; 64]),
             });
         }
 
         let payload = construct_batch_mint_payload(&env, &contract_id, &items, 1);
         let len = payload.len() as usize;
-        // Confirm the payload is well above the old 512-byte limit.
         assert!(
             len > 512,
             "batch payload should exceed old buffer: {len} bytes"
@@ -535,7 +643,6 @@ mod tests {
         payload.copy_into_slice(&mut out);
         let agg_sig = BytesN::from_array(&env, &signing_key.sign(&out).to_bytes());
 
-        // Must succeed — no panic, no OOB index.
         assert!(verify_batch_aggregated_signature(
             &env,
             &admin_pubkey,
@@ -547,17 +654,15 @@ mod tests {
         .is_ok());
     }
 
-    /// Regression: a single-item mint with a 32-character archetype symbol
-    /// (maximum Symbol length) must not panic in verify_ed25519.
     #[test]
     fn test_verify_mint_max_archetype_does_not_panic() {
         let env = Env::default();
         let contract_id = env.register(StellarWrapContract, ());
         let user = Address::generate(&env);
-        // 32-character symbol — the maximum allowed by the Soroban Symbol type.
         let archetype = Symbol::new(&env, "abcdefghijklmnopqrstuvwxyzabcdef");
         let data_hash = BytesN::from_array(&env, &[5u8; 32]);
         let period = 202601u64;
+        let valid_until = u64::MAX;
 
         let signing_key = SigningKey::from_bytes(&[88u8; 32]);
         let admin_pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
@@ -569,7 +674,8 @@ mod tests {
             period,
             &archetype,
             &data_hash,
-            1,
+            2,
+            valid_until,
         );
 
         assert!(verify_mint_signature(
@@ -580,25 +686,24 @@ mod tests {
             period,
             &archetype,
             &data_hash,
-            1,
+            2,
+            valid_until,
             &signature,
         )
         .is_ok());
     }
 
-    /// Regression: a payload exceeding MAX_VERIFY_PAYLOAD_BYTES must return
-    /// InvalidSignature instead of panicking or indexing out of bounds.
     #[test]
     fn test_verify_ed25519_rejects_oversized_payload() {
         let env = Env::default();
         let signing_key = SigningKey::from_bytes(&[99u8; 32]);
         let pubkey = BytesN::from_array(&env, &signing_key.verifying_key().to_bytes());
         let dummy_sig = BytesN::from_array(&env, &[0u8; 64]);
-
-        // Build a Bytes payload larger than MAX_VERIFY_PAYLOAD_BYTES.
         let oversized = Bytes::from_slice(&env, &vec![0u8; MAX_VERIFY_PAYLOAD_BYTES + 1]);
 
-        let result = verify_ed25519(&pubkey, &oversized, &dummy_sig);
-        assert_eq!(result, Err(ContractError::InvalidSignature));
+        assert_eq!(
+            verify_ed25519(&pubkey, &oversized, &dummy_sig),
+            Err(ContractError::InvalidSignature)
+        );
     }
 }
